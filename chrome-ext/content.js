@@ -20,6 +20,7 @@
   let sortHighest = false;
   let isLoading = false;
   let sessionData = null;
+  let activeArid = null;
   const reactTileMap = new Map();
 
   // ── Card Template ──────────────────────────────────────────────────
@@ -54,26 +55,31 @@
     const isUpTo = t.includes('up to');
     if (t.includes('%') && t.includes('back')) return 'percent';
     if (t.includes('$') && t.includes('back')) return isUpTo ? 'dollar-upto' : 'dollar-flat';
-    if (/\d+\s*x\b/.test(t) && t.includes('miles')) return 'miles-rate';
+    if (/\d+\s*x\b/.test(t)) return 'miles-rate';
     if (t.includes('miles')) return isUpTo ? 'miles-upto' : 'miles-flat';
     return 'other';
   }
 
   // ── Cache Storage ──────────────────────────────────────────────────
+  function getCacheKey(arid) {
+    return arid ? `${CONFIG.CACHE_KEY}_${arid}` : CONFIG.CACHE_KEY;
+  }
+
   function saveCache(deals, session) {
     try {
       const data = JSON.stringify({ deals, session });
-      localStorage.setItem(CONFIG.CACHE_KEY, data);
-      sessionStorage.setItem(CONFIG.CACHE_KEY, data);
+      const key = getCacheKey(session?.arid);
+      localStorage.setItem(key, data);
+      sessionStorage.setItem(key, data);
     } catch {}
   }
 
-  function loadCache() {
+  function loadCache(arid) {
     try {
-      const raw = localStorage.getItem(CONFIG.CACHE_KEY) || sessionStorage.getItem(CONFIG.CACHE_KEY);
+      const key = getCacheKey(arid);
+      const raw = localStorage.getItem(key) || sessionStorage.getItem(key);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return { deals: parsed, session: null };
       if (parsed && Array.isArray(parsed.deals) && parsed.deals.length > 0) return parsed;
       return null;
     } catch {
@@ -81,12 +87,49 @@
     }
   }
 
-  function clearCache() {
+  function clearCache(arid) {
     try {
-      localStorage.removeItem(CONFIG.CACHE_KEY);
-      sessionStorage.removeItem(CONFIG.CACHE_KEY);
+      const key = getCacheKey(arid);
+      localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
     } catch {}
   }
+
+  // ── Live Card Toggle Interception ──────────────────────────────────
+  function handleCardSwitch(newArid) {
+    if (!newArid || newArid === activeArid || isLoading) return;
+    activeArid = newArid;
+    allTiles = [];
+    searchQuery = '';
+    currentFilter = 'all';
+    sortHighest = false;
+
+    const cached = loadCache(newArid);
+    if (cached) {
+      allTiles = cached.deals;
+      sessionData = cached.session;
+      buildReactTileMap();
+      setLoadedUI(true);
+      renderGrid();
+    } else {
+      const grid = document.getElementById('c1ext-grid');
+      if (grid) grid.replaceChildren();
+      setLoadedUI(false);
+      buildReactTileMap();
+    }
+  }
+
+  const origFetch = window.fetch;
+  window.fetch = function (...args) {
+    try {
+      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+      const m = url?.match(/\/feed\/([^/?#]+)/);
+      if (m && m[1] !== 'offers' && !m[1].endsWith('.data')) {
+        handleCardSwitch(decodeURIComponent(m[1]));
+      }
+    } catch {}
+    return origFetch.apply(this, args);
+  };
 
   // ── Session & Navigation ───────────────────────────────────────────
   function getSessionData() {
@@ -95,22 +138,28 @@
                 window.__reactRouterDataRouter?.state?.loaderData?.root?.maybeUserSession ||
                 window.__remixContext?.state?.loaderData?.root?.maybeUserSession;
 
-      let arid = s?.maybeSelectedArid || s?.arids?.[0];
+      let arid = null;
       let viewInstanceId = s?.viewInstanceId;
       let contentSlug = s?.contentSlug;
       let cols = CONFIG.DEFAULT_GRID_COLS;
 
-      for (const entry of performance.getEntriesByType('resource')) {
-        const m = entry.name?.match(/\/feed\/([^/?#]+)/);
+      const entries = performance.getEntriesByType('resource');
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const m = entries[i].name?.match(/\/feed\/([^/?#]+)/);
         if (m) {
-          const url = new URL(entry.name);
-          arid = arid || decodeURIComponent(m[1]);
-          viewInstanceId = viewInstanceId || url.searchParams.get('viewInstanceId');
-          contentSlug = contentSlug || url.searchParams.get('contentSlug') || url.searchParams.get('initialContentSlug');
-          cols = url.searchParams.get('numberOfColumnsInGrid') || cols;
-          if (arid && viewInstanceId && contentSlug) break;
+          const candidate = decodeURIComponent(m[1]);
+          if (candidate !== 'offers' && !candidate.endsWith('.data')) {
+            const url = new URL(entries[i].name);
+            arid = candidate;
+            viewInstanceId = url.searchParams.get('viewInstanceId') || viewInstanceId;
+            contentSlug = url.searchParams.get('contentSlug') || url.searchParams.get('initialContentSlug') || contentSlug;
+            cols = url.searchParams.get('numberOfColumnsInGrid') || cols;
+            break;
+          }
         }
       }
+
+      arid = arid || s?.maybeSelectedArid || s?.arids?.[0];
 
       if (!viewInstanceId || !contentSlug) {
         const q = new URLSearchParams(window.location.search);
@@ -469,7 +518,7 @@
     }
 
     if (forceRefresh) {
-      clearCache();
+      clearCache(session.arid);
       allTiles = [];
     }
 
@@ -486,6 +535,7 @@
     updateProgress('Starting...');
 
     sessionData = session;
+    activeArid = session.arid;
     buildReactTileMap();
 
     try {
@@ -503,11 +553,13 @@
 
   // ── Cache Restoration ──────────────────────────────────────────────
   function restoreCachedDealsIfAvailable() {
-    const cached = loadCache();
+    const session = getSessionData();
+    const cached = loadCache(session?.arid);
     if (!cached || !cached.deals || cached.deals.length === 0) return false;
 
     allTiles = cached.deals;
-    sessionData = cached.session || getSessionData();
+    sessionData = cached.session || session;
+    activeArid = session?.arid || null;
     buildReactTileMap();
     setLoadedUI(true);
     renderGrid();
@@ -536,6 +588,8 @@
     const container = findGridContainer();
     if (container?.parentElement) {
       injectToolbar(container);
+      const session = getSessionData();
+      activeArid = session?.arid || null;
       restoreCachedDealsIfAvailable();
     }
   }
